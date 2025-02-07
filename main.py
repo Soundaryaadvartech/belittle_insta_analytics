@@ -7,5 +7,5 @@ load_dotenv()
 
 app = FastAPI(title = "Instagram Insights")
 
-app.include_router(router)
+app.include_router(router, prefix='/api')
 Base.metadata.create_all(bind=engine)
