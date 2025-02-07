@@ -10,6 +10,7 @@ from fastapi.responses import JSONResponse
 from database.models import SocialMedia, EngagedAudienceAge, EngagedAudienceGender, EngagedAudienceLocation, PostInsights,Posts
 from utilities.access_token import refresh_access_token, is_access_token_expired, generate_new_long_lived_token
 from database.database import get_db
+from utilities.fetch_posts_helper import process_posts_async, store_posts_and_metrics, get_posts_async
 
 router = APIRouter()
 
@@ -63,7 +64,7 @@ def fetch_insights_blt(db: Session = Depends(get_db)):
 
         # Fetch Instagram account details
         account_url = f"{BASE_URL}{BLT_INSTAGRAM_ACCOUNT_ID}?fields=id,username,followers_count&access_token={BLT_ACCESS_TOKEN}"
-        account_response = requests.get(account_url, timeout=60)
+        account_response = requests.get(account_url, timeout=120)
 
         if account_response.status_code != 200:
             raise HTTPException(
@@ -73,8 +74,8 @@ def fetch_insights_blt(db: Session = Depends(get_db)):
         account_data = account_response.json()
 
         # Fetch insights
-        insights_url = f"{BASE_URL}{BLT_INSTAGRAM_ACCOUNT_ID}/insights?metric=impressions,reach,accounts_engaged,website_clicks&period=day&metric_type=total_value&access_token={BLT_ACCESS_TOKEN}"
-        insights_response = requests.get(insights_url, timeout=60)
+        insights_url = f"{BASE_URL}{BLT_INSTAGRAM_ACCOUNT_ID}/insights?metric=reach,accounts_engaged,website_clicks&period=day&metric_type=total_value&access_token={BLT_ACCESS_TOKEN}"
+        insights_response = requests.get(insights_url, timeout=120)
 
         if insights_response.status_code != 200:
             raise HTTPException(
@@ -84,10 +85,8 @@ def fetch_insights_blt(db: Session = Depends(get_db)):
         insights_data = insights_response.json()
 
         # Extract insights
-        impressions, reach, accounts_engaged, website_clicks = None, None, None, None
+        reach, accounts_engaged, website_clicks = None, None, None
         for item in insights_data.get("data", []):
-            if item.get("name") == "impressions" and "total_value" in item:
-                impressions = item["total_value"].get("value")
             if item.get("name") == "reach" and "total_value" in item:
                 reach = item["total_value"].get("value")
             if item.get("name") == "accounts_engaged" and "total_value" in item:
@@ -99,7 +98,6 @@ def fetch_insights_blt(db: Session = Depends(get_db)):
         result = {
             "username": account_data.get("username"),
             "followers_count": account_data.get("followers_count"),
-            "impressions": impressions,
             "reach": reach,
             "accounts_engaged": accounts_engaged,
             "website_clicks": website_clicks,
@@ -108,7 +106,6 @@ def fetch_insights_blt(db: Session = Depends(get_db)):
         # Calculate the sum of existing records
         existing_sums = db.query(
             func.sum(SocialMedia.followers).label("total_followers"),
-            func.sum(SocialMedia.impressions).label("total_impressions"),
             func.sum(SocialMedia.reach).label("total_reach"),
             func.sum(SocialMedia.accounts_engaged).label("total_accounts_engaged"),
             func.sum(SocialMedia.website_clicks).label("total_website_clicks"),
@@ -116,14 +113,12 @@ def fetch_insights_blt(db: Session = Depends(get_db)):
 
         # Extract values or default to 0
         total_followers = existing_sums.total_followers or 0
-        total_impressions = existing_sums.total_impressions or 0
         total_reach = existing_sums.total_reach or 0
         total_accounts_engaged = existing_sums.total_accounts_engaged or 0
         total_website_clicks = existing_sums.total_website_clicks or 0
 
         # Calculate the differences (new data - sum of existing records)
         new_followers = result["followers_count"] - total_followers
-        new_impressions = result["impressions"] - total_impressions
         new_reach = result["reach"] - total_reach
         new_accounts_engaged = result["accounts_engaged"] - total_accounts_engaged
         new_website_clicks = result["website_clicks"] - total_website_clicks
@@ -137,7 +132,6 @@ def fetch_insights_blt(db: Session = Depends(get_db)):
         if existing_record:
             # Update today's record with calculated differences
             existing_record.followers += new_followers
-            existing_record.impressions += new_impressions
             existing_record.reach += new_reach
             existing_record.accounts_engaged += new_accounts_engaged
             existing_record.website_clicks += new_website_clicks
@@ -149,7 +143,6 @@ def fetch_insights_blt(db: Session = Depends(get_db)):
             socialmedia_analytics = SocialMedia(
                 username=result["username"],
                 followers=new_followers,
-                impressions=new_impressions,
                 reach=new_reach,
                 accounts_engaged=new_accounts_engaged,
                 website_clicks=new_website_clicks,
@@ -213,9 +206,9 @@ def engaged_audience_demographics(db: Session = Depends(get_db)):
         }
 
         # Fetch demographic data by breakdown types
-        age_response = requests.get(insights_url, params={**params, "breakdown": "age"}, timeout=60)
-        gender_response = requests.get(insights_url, params={**params, "breakdown": "gender"}, timeout=60)
-        city_response = requests.get(insights_url, params={**params, "breakdown": "city"}, timeout=60)
+        age_response = requests.get(insights_url, params={**params, "breakdown": "age"}, timeout=120)
+        gender_response = requests.get(insights_url, params={**params, "breakdown": "gender"}, timeout=120)
+        city_response = requests.get(insights_url, params={**params, "breakdown": "city"}, timeout=120)
 
         if age_response.status_code != 200:
             raise HTTPException(
@@ -332,151 +325,48 @@ def engaged_audience_demographics(db: Session = Depends(get_db)):
         return JSONResponse(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, content={"error": "Something went wrong."})
 
 @router.get("/fetch_all_posts")
-def fetch_all_posts(db: Session = Depends(get_db)):
+async def fetch_all_posts(db: Session = Depends(get_db)):
     try:
         global BLT_ACCESS_TOKEN
 
-        # Refresh the short-lived token
+        # Refresh the short-lived token if expired
         if is_access_token_expired(BLT_ACCESS_TOKEN):
             try:
                 refreshed_token = refresh_access_token(APP_ID, APP_SECRET, LONG_LIVED_TOKEN)
-                set_key('.env', 'BLT_ACCESS_TOKEN', refreshed_token)
-                load_dotenv()  # Reload the updated .env file
-                BLT_ACCESS_TOKEN = os.getenv("BLT_ACCESS_TOKEN")  # Get updated token
-            except Exception as e:
-                try:
-                    new_long_lived_token = generate_new_long_lived_token()
-                    set_key('.env', 'LONG_LIVED_TOKEN', new_long_lived_token)
-                    load_dotenv()  # Reload the updated .env file
-                    BLT_ACCESS_TOKEN = refresh_access_token(APP_ID, APP_SECRET, new_long_lived_token)
-                    set_key('.env', 'BLT_ACCESS_TOKEN', BLT_ACCESS_TOKEN)
-                    load_dotenv()  # Reload the updated .env file
-                except Exception as gen_error:
-                    raise HTTPException(
-                        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                        detail=f"Failed to generate new long-lived token: {str(gen_error)}"
-                    )
-                raise HTTPException(
-                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    detail=f"Failed to refresh access token: {str(e)}"
-                )
+                os.environ["BLT_ACCESS_TOKEN"] = refreshed_token
+                BLT_ACCESS_TOKEN = refreshed_token
+            except Exception:
+                new_long_lived_token = generate_new_long_lived_token()
+                os.environ["LONG_LIVED_TOKEN"] = new_long_lived_token
+                BLT_ACCESS_TOKEN = refresh_access_token(APP_ID, APP_SECRET, new_long_lived_token)
+                os.environ["BLT_ACCESS_TOKEN"] = BLT_ACCESS_TOKEN
 
-        # Paginate through all posts
+        # Fetch all posts
         all_posts = []
         posts_url = f"{BASE_URL}{BLT_INSTAGRAM_ACCOUNT_ID}/media"
         params = {
             "fields": "id,media_type,media_url,timestamp",
             "access_token": BLT_ACCESS_TOKEN,
+            "limit": 100,
         }
-        while posts_url:
-            posts_response = requests.get(posts_url, params=params, timeout=60)
-            if posts_response.status_code != 200:
-                raise HTTPException(
-                    status_code=posts_response.status_code,
-                    detail=f"Failed to fetch posts: {posts_response.text}"
-                )
 
-            posts_data = posts_response.json()
-            all_posts.extend(posts_data.get("data", []))
-            posts_url = posts_data.get("paging", {}).get("next")  # Get next page URL if available
+        MAX_PAGES = 100  # Prevent infinite loops
+        while posts_url and len(all_posts) < MAX_PAGES * params["limit"]:
+            response = await get_posts_async(posts_url, params)
+            all_posts.extend(response.get("data", []))
+            posts_url = response.get("paging", {}).get("next")
 
         if not all_posts:
             return JSONResponse(content={"message": "No posts found."})
 
-        # Process each post
-        for post in all_posts:
-            post_id = post.get("id")
-            media_type = post.get("media_type")
-            media_url = post.get("media_url")
-            raw_timestamp = post.get("timestamp")
+        # Process posts asynchronously
+        metrics = await process_posts_async(all_posts, BLT_ACCESS_TOKEN)
 
-            # Parse post creation timestamp
-            post_created = None
-            if raw_timestamp:
-                utc_time = datetime.strptime(raw_timestamp, "%Y-%m-%dT%H:%M:%S%z")
-                post_created = utc_time.strftime("%Y-%m-%d")
-
-            # Check if the post already exists in the database
-            existing_post = db.query(Posts).filter(Posts.post_id == post_id).first()
-            if not existing_post:
-                # Insert a new post
-                db_post = Posts(post_id=post_id, media_type=media_type, media_url=media_url, post_created=post_created, created_ts=datetime.now(timezone.utc), updated_ts=datetime.now(timezone.utc))
-                db.add(db_post)
-                db.commit()
-                db.refresh(db_post)
-            else:
-                db_post = existing_post
-
-            # Fetch and process metrics (likes, reach, saves)
-            def fetch_metric(url):
-                response = requests.get(url, timeout=60)
-                if response.status_code != 200:
-                    raise HTTPException(
-                        status_code=response.status_code,
-                        detail=f"Failed to fetch metrics: {response.text}"
-                    )
-                return response.json()
-
-            likes_url = f"{BASE_URL}{post_id}?fields=like_count&access_token={BLT_ACCESS_TOKEN}"
-            insights_url = f"{BASE_URL}{post_id}/insights?metric=reach,saved&access_token={BLT_ACCESS_TOKEN}"
-
-            # Fetch metrics
-            likes_data = fetch_metric(likes_url)
-            insights_data = fetch_metric(insights_url)
-
-            like_count = likes_data.get("like_count", 0)
-            reach = next((item["values"][0]["value"] for item in insights_data.get("data", [])
-                          if item["name"] == "reach"), 0)
-            saves = next((item["values"][0]["value"] for item in insights_data.get("data", [])
-                          if item["name"] == "saved"), 0)
-
-            # Fetch existing metrics and calculate differences
-            existing_sums = db.query(
-                func.sum(PostInsights.likes).label("total_likes"),
-                func.sum(PostInsights.saves).label("total_saves"),
-                func.sum(PostInsights.reach).label("total_reach"),
-            ).filter(PostInsights.posts_id == db_post.id).first()
-
-            total_likes = existing_sums.total_likes or 0
-            total_saves = existing_sums.total_saves or 0
-            total_reach = existing_sums.total_reach or 0
-
-            new_likes = like_count - total_likes
-            new_saves = saves - total_saves
-            new_reach = reach - total_reach
-
-            today_date = datetime.now(timezone.utc).date()
-            existing_insight = db.query(PostInsights).filter(
-                PostInsights.posts_id == db_post.id,
-                func.date(PostInsights.created_ts) == today_date
-            ).first()
-
-            if existing_insight:
-                existing_insight.reach += new_reach
-                existing_insight.likes += new_likes
-                existing_insight.saves += new_saves
-                existing_insight.updated_ts = datetime.now(timezone.utc)
-                db.commit()
-                db.refresh(existing_insight)
-            else:
-                db_insight = PostInsights(
-                    posts_id=db_post.id,
-                    reach=new_reach,
-                    likes=new_likes,
-                    saves=new_saves,
-                    created_ts=datetime.now(timezone.utc),
-                    updated_ts=datetime.now(timezone.utc),
-                )
-                db.add(db_insight)
-                db.commit()
-                db.refresh(db_insight)
-
+        # Store in database
+        store_posts_and_metrics(all_posts, metrics, db)
 
         return JSONResponse(content={"message": "Successfully fetched all posts and metrics."})
 
-    except HTTPException as e:
+    except Exception as e:
         traceback.print_exc()
-        return JSONResponse(status_code=e.status_code, content={"error": e.detail})
-    except Exception:
-        traceback.print_exc()
-        return JSONResponse(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, content={"error": "Something went wrong."})
+        raise HTTPException(status_code=500, detail=f"An error occurred: {str(e)}")
